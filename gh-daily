@@ -100,7 +100,6 @@ if ! date -d "$DATE" "+%Y-%m-%d" &>/dev/null; then
   echo "Error: Invalid date '$DATE'. Use YYYY-MM-DD format."
   exit 1
 fi
-DATE=$(date -d "$DATE" "+%Y-%m-%d")
 
 if [[ ! "$FORMAT" =~ ^(text|markdown|email)$ ]]; then
   echo "Error: Format must be text, markdown, or email (got: $FORMAT)"
@@ -176,7 +175,7 @@ if [[ "$VERBOSE" == true ]]; then
         commits: [.[] | {
           sha: .sha[0:7],
           subject: (.commit.message | split("\n")[0]),
-          body:  (.commit.message | split("\n")[1:] | if length > 0 then join("\n") else "" end),
+          body:  (.commit.message | split("\n")[1:] | map(select(length > 0)) | if length > 0 then join("\n") else "" end),
           url: .html_url
         }]
       }
@@ -219,7 +218,7 @@ print_commit_text() {
     if [[ -n "$body" ]]; then
       local body_indent=$((indent + 2))
       local body_spc
-      body_spc=$(printf '%*s' "$body_indent' '")
+      body_spc=$(printf '%*s' "$body_indent" "")
       echo "$body" | sed "s/^/${body_spc}/" | sed '/^$/d'
       printf "\n"
     fi
@@ -239,9 +238,7 @@ print_commit_md() {
     local body
     body=$(echo "$c" | jq -r '.body // ""')
     if [[ -n "$body" ]]; then
-      printf "  \n"
-      echo "$body" | sed 's/^/  > /' | sed '/^> $/d'
-      printf "\n"
+      echo "$body" | sed 's/^/  > /'
     fi
   fi
 }

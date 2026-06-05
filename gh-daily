@@ -1,0 +1,276 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_NAME="gh-daily"
+
+show_help() {
+  cat <<EOF
+gh-daily: Daily commit digest generator
+
+Generate a digest of all commits by an author on a specific date.
+Output formats include plain text (readable out loud) and markdown (exportable as email).
+
+Usage:
+  gh daily --author <username> --date <YYYY-MM-DD> [options]
+
+Options:
+  -a, --author <username>   GitHub username (required)
+  -d, --date <YYYY-MM-DD>   Date for the digest (required)
+  -r, --repo <owner/repo>   Limit to specific repository
+  -f, --format <format>     Output format: text, markdown, email (default: text)
+  --no-color                 Disable colored output
+  --help, -h                 Show this help message
+
+Examples:
+  gh daily --author johndoe --date 2024-01-15
+  gh daily -a johndoe -d 2024-01-15 -r myorg/myrepo -f markdown
+  gh daily -a johndoe -d 2024-01-15 -f email | tee digest.txt
+
+Format notes:
+  text     - Plain text, suitable for reading aloud
+  markdown - Markdown format, suitable for email or docs
+  email    - Email-ready plain text with subject line
+
+Exit codes:
+  0 - Success
+  1 - Error (missing args, API failure, etc.)
+  2 - No commits found
+EOF
+}
+
+AUTHOR=""
+DATE=""
+REPO=""
+FORMAT="text"
+NO_COLOR=false
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -a|--author)
+      AUTHOR="$2"
+      shift 2
+      ;;
+    -d|--date)
+      DATE="$2"
+      shift 2
+      ;;
+    -r|--repo)
+      REPO="$2"
+      shift 2
+      ;;
+    -f|--format)
+      FORMAT="$2"
+      shift 2
+      ;;
+    --no-color)
+      NO_COLOR=true
+      shift
+      ;;
+    -h|--help)
+      show_help
+      exit 0
+      ;;
+    *)
+      echo "Error: Unknown option '$1'"
+      show_help
+      exit 1
+      ;;
+  esac
+done
+
+if [[ -z "$AUTHOR" ]]; then
+  echo "Error: --author is required"
+  show_help
+  exit 1
+fi
+
+if [[ -z "$DATE" ]]; then
+  echo "Error: --date is required"
+  show_help
+  exit 1
+fi
+
+if ! date -d "$DATE" "+%Y-%m-%d" &>/dev/null; then
+  echo "Error: Invalid date '$DATE'. Use YYYY-MM-DD format."
+  exit 1
+fi
+DATE=$(date -d "$DATE" "+%Y-%m-%d")
+
+if [[ ! "$FORMAT" =~ ^(text|markdown|email)$ ]]; then
+  echo "Error: Format must be text, markdown, or email (got: $FORMAT)"
+  exit 1
+fi
+
+BOLD=""
+RESET=""
+if [[ "$NO_COLOR" == false ]] && [[ -t 1 ]]; then
+  BOLD="\033[1m"
+  RESET="\033[0m"
+fi
+
+NEXT_DATE=$(date -d "$DATE + 1 day" "+%Y-%m-%d")
+
+if ! gh auth status &>/dev/null; then
+  echo "Error: Not authenticated with GitHub CLI. Run 'gh auth login' first."
+  exit 1
+fi
+
+QUERY="author:${AUTHOR}+author-date:${DATE}"
+[[ -n "$REPO" ]] && QUERY="${QUERY}+repo:${REPO}"
+
+echo "Searching commits for ${AUTHOR} on ${DATE}..." >&2
+if [[ -n "$REPO" ]]; then
+  echo "  Repository: ${REPO}" >&2
+fi
+
+COMMITS="[]"
+PAGE=1
+TOTAL_COUNT=0
+
+while true; do
+  RESPONSE=$(gh api \
+    --method GET \
+    "search/commits?q=${QUERY}&per_page=100&page=${PAGE}" \
+    --jq '{total: .total_count, items: .items}' 2>/dev/null) || {
+    echo "Error: API request failed. Check your network and permissions."
+    exit 1
+  }
+
+  PAGE_TOTAL=$(echo "$RESPONSE" | jq '.total // 0')
+  [[ "$PAGE" -eq 1 ]] && TOTAL_COUNT="$PAGE_TOTAL"
+
+  ITEMS=$(echo "$RESPONSE" | jq '.items // []')
+  ITEM_COUNT=$(echo "$ITEMS" | jq 'length')
+  [[ "$ITEM_COUNT" -eq 0 ]] && break
+
+  COMMITS=$(echo "$COMMITS" "$ITEMS" | jq -s 'add')
+
+  if [[ "$ITEM_COUNT" -lt 100 ]]; then
+    break
+  fi
+  PAGE=$((PAGE + 1))
+  if [[ "$PAGE" -gt 10 ]]; then
+    echo "Warning: More than 1000 commits found. Results truncated." >&2
+    break
+  fi
+done
+
+COMMIT_COUNT=$(echo "$COMMITS" | jq 'length')
+
+if [[ "$COMMIT_COUNT" -eq 0 ]]; then
+  echo "No commits found for ${AUTHOR} on ${DATE}."
+  exit 2
+fi
+
+REPO_COUNT=$(echo "$COMMITS" | jq '[.[].repository.full_name] | unique | length')
+
+REPO_GROUPS=$(echo "$COMMITS" | jq -c '
+  group_by(.repository.full_name)
+  | sort_by(-length)
+  | .[]
+  | {
+      repo: .[0].repository.full_name,
+      repo_url: .[0].repository.html_url,
+      count: length,
+      commits: [.[] | {sha: .sha[0:7], message: (.commit.message | split("\n")[0]), url: .html_url}]
+    }
+')
+
+case "$FORMAT" in
+  text)
+    printf "${BOLD}Daily Commit Digest${RESET}\n"
+    printf "%s\n" "$(printf '=%.0s' {1..60})"
+    printf "Author: %s\n" "$AUTHOR"
+    printf "Date:   %s\n" "$DATE"
+    printf "%s\n" "$(printf '=%.0s' {1..60})"
+    printf "\n"
+    printf "Found ${BOLD}%d${RESET} commits across ${BOLD}%d${RESET} repositor%s.\n" \
+      "$COMMIT_COUNT" "$REPO_COUNT" "$( [[ $REPO_COUNT -eq 1 ]] && echo 'y' || echo 'ies' )"
+    printf "\n"
+
+    while IFS= read -r group; do
+      REPO_NAME=$(echo "$group" | jq -r '.repo')
+      GROUP_COUNT=$(echo "$group" | jq -r '.count')
+      printf "${BOLD}%s${RESET} (%d commit%s)\n" "$REPO_NAME" "$GROUP_COUNT" "$( [[ $GROUP_COUNT -eq 1 ]] && echo '' || echo 's' )"
+      echo "$group" | jq -c '.commits[]' | while IFS= read -r c; do
+        SHA=$(echo "$c" | jq -r '.sha')
+        MSG=$(echo "$c" | jq -r '.message')
+        printf "  \xe2\x80\xa2 %s (%s)\n" "$MSG" "$SHA"
+      done
+      printf "\n"
+    done <<< "$REPO_GROUPS"
+
+    printf "%s\n" "$(printf '=%.0s' {1..60})"
+    printf "Summary: %d commits across %d repositor%s\n" \
+      "$COMMIT_COUNT" "$REPO_COUNT" "$( [[ $REPO_COUNT -eq 1 ]] && echo 'y' || echo 'ies' )"
+    printf "Generated by gh-daily on %s\n" "$(date "+%Y-%m-%d %H:%M:%S")"
+    ;;
+
+  markdown)
+    printf "# Daily Commit Digest\n\n"
+    printf "**Author:** %s  \n" "$AUTHOR"
+    printf "**Date:** %s  \n\n" "$DATE"
+    printf "Found **%d** commits across **%d** repositor%s.\n\n" \
+      "$COMMIT_COUNT" "$REPO_COUNT" "$( [[ $REPO_COUNT -eq 1 ]] && echo 'y' || echo 'ies' )"
+    printf -- "---\n\n"
+
+    while IFS= read -r group; do
+      REPO_NAME=$(echo "$group" | jq -r '.repo')
+      GROUP_COUNT=$(echo "$group" | jq -r '.count')
+      printf "### %s (%d commit%s)\n\n" "$REPO_NAME" "$GROUP_COUNT" "$( [[ $GROUP_COUNT -eq 1 ]] && echo '' || echo 's' )"
+      echo "$group" | jq -c '.commits[]' | while IFS= read -r c; do
+        SHA=$(echo "$c" | jq -r '.sha')
+        MSG=$(echo "$c" | jq -r '.message')
+        printf -- "- \`%s\` %s\n" "$SHA" "$MSG"
+      done
+      printf "\n"
+    done <<< "$REPO_GROUPS"
+
+    printf -- "---\n\n"
+    printf "**Summary:** %d commits across %d repositor%s  \n" \
+      "$COMMIT_COUNT" "$REPO_COUNT" "$( [[ $REPO_COUNT -eq 1 ]] && echo 'y' || echo 'ies' )"
+    printf "_Generated by gh-daily on %s_\n" "$(date "+%Y-%m-%d %H:%M:%S")"
+    ;;
+
+  email)
+    REPO_LIST=""
+    while IFS= read -r group; do
+      REPO_NAME=$(echo "$group" | jq -r '.repo')
+      GROUP_COUNT=$(echo "$group" | jq -r '.count')
+      REPO_LIST="${REPO_LIST}  - ${REPO_NAME} (${GROUP_COUNT} commits)\n"
+    done <<< "$REPO_GROUPS"
+    REPO_LIST="${REPO_LIST%\\n}"
+
+    cat << EMAIL_HEADER
+Subject: Daily Commit Digest - ${AUTHOR} - ${DATE}
+To: RECIPIENT@example.com
+
+Hi,
+
+Here is the commit digest for ${AUTHOR} on ${DATE}:
+
+Found ${COMMIT_COUNT} commits across ${REPO_COUNT} repositor$( [[ $REPO_COUNT -eq 1 ]] && echo 'y' || echo 'ies' ).
+
+---
+
+EMAIL_HEADER
+
+    while IFS= read -r group; do
+      REPO_NAME=$(echo "$group" | jq -r '.repo')
+      GROUP_COUNT=$(echo "$group" | jq -r '.count')
+      printf "Repository: %s (%d commit%s)\n" "$REPO_NAME" "$GROUP_COUNT" "$( [[ $GROUP_COUNT -eq 1 ]] && echo '' || echo 's' )"
+      echo "$group" | jq -c '.commits[]' | while IFS= read -r c; do
+        SHA=$(echo "$c" | jq -r '.sha')
+        MSG=$(echo "$c" | jq -r '.message')
+        printf "  - %s (%s)\n" "$MSG" "$SHA"
+      done
+      printf "\n"
+    done <<< "$REPO_GROUPS"
+
+    printf -- "---\n\n"
+    printf "Summary: %d commits across %d repositor%s\n" \
+      "$COMMIT_COUNT" "$REPO_COUNT" "$( [[ $REPO_COUNT -eq 1 ]] && echo 'y' || echo 'ies' )"
+    printf "\n"
+    printf "This digest was automatically generated by gh-daily.\n"
+    ;;
+esac
